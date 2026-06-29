@@ -1,17 +1,36 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, UploadFile, File
 from pydantic import BaseModel
-from app.config import OPENAI_API_KEY, llm_with_tools
+from app.graph import admissions_agent
+from app.ingest import ingest as run_ingest
+import shutil, os
 
 router = APIRouter()
 
 
 class MessageRequest(BaseModel):
-    course: str
-    batch: str
+    message: str
 
 
 @router.post("/message")
 def handle_message(body: MessageRequest):
-    resp = llm_with_tools.invoke("JEE 2 saal ki fees kitni hai?")
-    print(resp.tool_calls)
-    return {"reply": f"Fee lookup result: {resp}"}
+    result = admissions_agent.invoke(
+        {"messages": [{"role": "user", "content": body.message}]},
+        config={"recursion_limit": 10},
+    )
+    reply = result["messages"][-1].content
+    return {"reply": reply}
+
+
+@router.post("/ingest", tags=["Ingest"])
+def ingest_route():
+    try:
+        chunks = run_ingest()
+        return {
+            "status": "success",
+            "message": f"Successfully loaded and split documents into {len(chunks)} chunks."
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
