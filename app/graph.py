@@ -1,5 +1,6 @@
 from contextlib import ExitStack
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.types import Command
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -9,6 +10,7 @@ from langchain_core.tools.retriever import create_retriever_tool
 from langgraph.prebuilt import create_react_agent
 from app.config import llm, embeddings, CHROMA_DIR, COLLECTION, DATABASE_URL
 from app.tools import get_fee, COVERAGE_GATE_REPLY
+from app.scheduling_agent import scheduling_agent
 
 
 # --- State ---
@@ -19,10 +21,10 @@ class State(MessagesState):
 
 # --- Supervisor ---
 
-members = ["admission", "faq"]
+members = ["admission", "faq", "scheduling"]
 
 class Router(TypedDict):
-    next: Literal["admission", "faq", "FINISH"]
+    next: Literal["admission", "faq", "scheduling", "FINISH"]
 
 system_prompt = f"""
 You are a supervisor managing a conversation between these workers: {members}.
@@ -34,6 +36,9 @@ You are a supervisor managing a conversation between these workers: {members}.
   documents required, refund policy, installments, discipline, and other
   institute policy questions, by searching institute documents. Never route
   fee-amount questions here.
+- scheduling: handles booking or scheduling a demo class (e.g. "book a demo",
+  "schedule a class", "demo class chahiye"). It reserves an actual slot with a
+  tool. Route here for ANY request to book, schedule, or reserve a demo class.
 
 Given the user request, choose which worker should act next.
 Each worker will respond with their result.
@@ -56,7 +61,7 @@ already fully addresses its part of the question.
 """
 
 
-def supervisor_node(state: State) -> Command[Literal["admission", "faq", "__end__"]]:
+def supervisor_node(state: State) -> Command[Literal["admission", "faq", "scheduling", "__end__"]]:
     # Workers that already responded since the user's last message. The router
     # LLM doesn't reliably self-limit (it can re-pick the same worker forever
     # on a hedge-y answer), so this is a deterministic backstop against loops.
@@ -155,12 +160,35 @@ def faq_node(state: State) -> Command[Literal["supervisor"]]:
     )
 
 
+# --- Scheduling agent (demo booking) ---
+
+def scheduling_node(state: State, config: RunnableConfig) -> Command[Literal["supervisor"]]:
+    print("[scheduling] invoked")
+    phone = config["configurable"]["thread_id"]
+    messages = [
+        SystemMessage(
+            f"The user's phone number is {phone}. Use this automatically for "
+            "any book_demo call — never ask the user for their phone number."
+        )
+    ] + state["messages"]
+    result = scheduling_agent.invoke({"messages": messages})
+    reply = result["messages"][-1].content
+    print(f"[scheduling] reply -> {reply}")
+    return Command(
+        goto="supervisor",
+        update={
+            "messages": [HumanMessage(reply, name="scheduling")]
+        },
+    )
+
+
 # --- Graph ---
 
 workflow = StateGraph(State)
 workflow.add_node("supervisor", supervisor_node)
 workflow.add_node("admission", admission_node)
 workflow.add_node("faq", faq_node)
+workflow.add_node("scheduling", scheduling_node)
 
 workflow.add_edge(START, "supervisor")
 
