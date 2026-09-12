@@ -1,0 +1,23 @@
+# ===================================================================
+# Caddyfile — the instruction sheet for your "front desk" (reverse proxy).
+# Lines starting with #  are comments (notes for humans). Caddy ignores them.
+# The only lines that actually DO anything are the two inside the :80 block.
+# ===================================================================
+
+# ---- LOCAL setup (what you use on your laptop) ----
+# ":80" means: listen for visitors on port 80 (normal web traffic, http).
+:80 {
+    # Take every visitor and send them to the "app" container on port 8000.
+    # "app" is the name of your app service in docker-compose.yml.
+    reverse_proxy app:8000
+}
+
+
+# ---- REAL-DOMAIN setup (only when you own a website address) ----
+# When you have a domain, delete the :80 block above and use a block like this
+# instead. Caddy will AUTOMATICALLY get a free HTTPS security certificate for it
+# — no extra work from you.
+#
+# sahayak.yourdomain.com {
+#     reverse_proxy app:8000
+# }

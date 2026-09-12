@@ -1,5 +1,5 @@
 from contextlib import ExitStack
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.types import Command
@@ -11,6 +11,7 @@ from langgraph.prebuilt import create_react_agent
 from app.config import llm, embeddings, CHROMA_DIR, COLLECTION, DATABASE_URL
 from app.tools import get_fee, COVERAGE_GATE_REPLY
 from app.scheduling_agent import scheduling_agent
+import os
 
 
 # --- State ---
@@ -19,46 +20,43 @@ class State(MessagesState):
     next: str
 
 
+from pydantic import BaseModel, Field
+
 # --- Supervisor ---
 
 members = ["admission", "faq", "scheduling"]
 
-class Router(TypedDict):
-    next: Literal["admission", "faq", "scheduling", "FINISH"]
+class Router(BaseModel):
+    next: Literal["admission", "faq", "scheduling", "FINISH"] = Field(
+        default="FINISH",
+        description="The next worker agent to handle the request, or FINISH if completed."
+    )
 
 system_prompt = f"""
 You are a supervisor managing a conversation between these workers: {members}.
 
-- admission: handles ONLY fee, cost, price, charges, and batch-duration questions.
+- admission: handles ONLY fee, cost, price, charges, and batch-duration numerical lookups.
   It looks up exact fee amounts with a tool. Route here for ANY question that asks
-  "how much" or "what is the fee/cost" for a course or batch.
+  "how much" or "what is the fee/cost" for a specific course or batch.
 - faq: handles questions about syllabus, schedule, eligibility, exam pattern,
-  documents required, refund policy, installments, discipline, and other
-  institute policy questions, by searching institute documents. Never route
-  fee-amount questions here.
+  documents required, refund policy, installment rules, discipline, and other
+  institute policy questions, by searching institute documents. Route refund policy
+  and installment rules questions here. Never route specific course fee-amount questions here.
 - scheduling: handles booking or scheduling a demo class (e.g. "book a demo",
-  "schedule a class", "demo class chahiye"). It reserves an actual slot with a
-  tool. Route here for ANY request to book, schedule, or reserve a demo class.
+  "schedule a class", "demo class chahiye", or providing a time/date for a demo).
+  It reserves an actual slot with a tool. Route here for ANY request to book, schedule,
+  or reserve a demo class, or when the user provides a time/slot choice, date, or
+  follow-up response to demo booking (e.g. "Kal subah 11 baje", "13 September", "book karni h").
 
 Given the user request, choose which worker should act next.
 Each worker will respond with their result.
-A single worker's response may only cover PART of the user's original question
-(each worker ignores topics outside its own scope). Compare what has been
-answered so far against the full ORIGINAL user question (not the workers'
-replies) to decide what, if anything, is still missing:
-- If every distinct topic actually present in the ORIGINAL question (e.g. both
-  a fee part and a separate documents/eligibility/policy part) has now been
-  addressed, respond with FINISH.
-- If admission replies with "{COVERAGE_GATE_REPLY}", treat the fee part as
-  fully handled (it is a deliberate final answer, not an incomplete one) —
-  do not route to faq to try to find that same fee or batch elsewhere, since
-  faq cannot look up fees either. Only route to faq afterward if the ORIGINAL
-  question also explicitly asked about something outside fees.
-- Never route to a worker to address a topic the user never actually asked
-  about.
-Do not route to another worker just to double-check or rephrase an answer that
-already fully addresses its part of the question.
+- ALWAYS route to scheduling if the user's latest message is a follow-up answer or slot choice (e.g. providing a time, date, or repeat booking request) to a previous scheduling prompt or alternative options offer, unless scheduling has ALREADY responded in this current user turn.
+A single worker's response may only cover PART of the user's original question.
+Compare what has been answered so far against the full ORIGINAL user question to decide what, if anything, is still missing:
+- If every distinct topic actually present in the user request has now been addressed in the current turn, respond with FINISH.
+- If admission replies with "{COVERAGE_GATE_REPLY}", treat the fee part as fully handled — do not route to faq to try to find that same fee.
 """
+
 
 
 def supervisor_node(state: State) -> Command[Literal["admission", "faq", "scheduling", "__end__"]]:
@@ -77,9 +75,34 @@ def supervisor_node(state: State) -> Command[Literal["admission", "faq", "schedu
         print(f"[supervisor] all workers visited ({visited}) -> FINISH")
         return Command(goto=END, update={"next": END})
 
+    # Check if the previous turn's last AI message was from scheduling (asking for slot/time or offering alternatives).
+    # If the user is giving a follow-up response to scheduling, and scheduling hasn't run yet in this turn,
+    # deterministically route to scheduling.
+    if "scheduling" not in visited:
+        last_ai_worker = None
+        for msg in reversed(state["messages"][:-1]):  # exclude current user message
+            msg_name = getattr(msg, "name", None)
+            if msg_name in members:
+                last_ai_worker = msg_name
+                break
+        
+        if last_ai_worker == "scheduling":
+            latest_text = getattr(state["messages"][-1], "content", "").lower()
+            fee_keywords = ["fee", "cost", "price", "kitni fee", "kitne paise", "kitna fee"]
+            if not any(k in latest_text for k in fee_keywords):
+                print("[supervisor] deterministic follow-up -> scheduling")
+                return Command(goto="scheduling", update={"next": "scheduling"})
+
     messages = [{"role": "system", "content": system_prompt}] + state["messages"]
     response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
+
+    if isinstance(response, Router):
+        goto = response.next
+    elif isinstance(response, dict):
+        goto = response.get("next", "FINISH")
+    else:
+        goto = "FINISH"
+
     if goto == "FINISH" or goto in visited:
         goto = END
     print(f"[supervisor] decided next -> {goto}")
@@ -115,7 +138,7 @@ def admission_node(state: State) -> Command[Literal["supervisor"]]:
     return Command(
         goto="supervisor",
         update={
-            "messages": [HumanMessage(reply, name="admission")]
+            "messages": [AIMessage(content=reply, name="admission")]
         },
     )
 
@@ -130,7 +153,7 @@ store = Chroma(
 retriever_tool = create_retriever_tool(
     store.as_retriever(search_kwargs={"k": 4}),
     "search_institute_docs",
-    "Search institute documents to answer questions about syllabus, schedule, eligibility, exam pattern, or admission policy.",
+    "Search institute documents to answer questions about syllabus, schedule, eligibility, exam pattern, refund policy, or admission policy.",
 )
 
 faq_react_agent = create_react_agent(
@@ -138,11 +161,11 @@ faq_react_agent = create_react_agent(
     tools=[retriever_tool],
     prompt=(
         "You are a helpful FAQ assistant for a coaching institute. "
-        "Answer questions about syllabus, schedules, eligibility, and policies "
-        "by searching the institute documents. "
-        "You do NOT handle fee, cost, or price questions — another assistant already "
-        "handles those. If the user's question includes a fee/cost part, ignore that "
-        "part entirely and answer only the non-fee part."
+        "Answer questions about syllabus, schedules, eligibility, refund policies, installment rules, and other policies "
+        "by searching the institute documents with your search_institute_docs tool. "
+        "You do NOT handle course fee amount lookup questions (e.g. 'how much is the course fee?') — another assistant handles those. "
+        "However, you DO handle policy questions including refund policy, fee installments, rules, and cancellation terms. "
+        "If a user asks whether fees are refundable or what the refund policy is, search the documents for refund policy and answer clearly."
     ),
 )
 
@@ -155,7 +178,7 @@ def faq_node(state: State) -> Command[Literal["supervisor"]]:
     return Command(
         goto="supervisor",
         update={
-            "messages": [HumanMessage(reply, name="faq")]
+            "messages": [AIMessage(content=reply, name="faq")]
         },
     )
 
@@ -177,9 +200,11 @@ def scheduling_node(state: State, config: RunnableConfig) -> Command[Literal["su
     return Command(
         goto="supervisor",
         update={
-            "messages": [HumanMessage(reply, name="scheduling")]
+            "messages": [AIMessage(content=reply, name="scheduling")]
         },
     )
+
+
 
 
 # --- Graph ---
@@ -192,17 +217,27 @@ workflow.add_node("scheduling", scheduling_node)
 
 workflow.add_edge(START, "supervisor")
 
-# The connection stays open for the lifetime of the process (module-level,
-# same as admissions_agent below); ExitStack just avoids leaving the
-# PostgresSaver.from_conn_string context manager unentered.
-_checkpointer_ctx = ExitStack()
-checkpointer = _checkpointer_ctx.enter_context(PostgresSaver.from_conn_string(DATABASE_URL))
+from psycopg_pool import ConnectionPool
 
-# One-time setup: creates the checkpointer's own tables if they don't exist yet.
-# Safe to call on every startup — it only does work the first time.
+# Use ConnectionPool to automatically manage and reconnect dropped idle database connections (e.g. Neon serverless auto-suspend)
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    max_size=20,
+    max_idle=30,
+    reconnect_timeout=60,
+    check=ConnectionPool.check_connection,
+    kwargs={"autocommit": True, "prepare_threshold": 0},
+)
+
+checkpointer = PostgresSaver(pool)
 checkpointer.setup()
 
 admissions_agent = workflow.compile(checkpointer=checkpointer)
 
-with open("graph.png", "wb") as f:
-    f.write(admissions_agent.get_graph().draw_mermaid_png())
+if os.getenv("GENERATE_GRAPH_PNG", "false").lower() == "true":
+    try:
+        with open("graph.png", "wb") as f:
+            f.write(admissions_agent.get_graph().draw_mermaid_png())
+        print("[graph] graph.png regenerated")
+    except Exception as e:
+        print(f"[graph] skipped graph.png generation: {e}")

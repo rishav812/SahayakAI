@@ -1,0 +1,84 @@
+# LOCAL development stack for SahayakAI (your "practice kitchen").
+# Runs three boxes together and wires them up:
+#   caddy (front door)  ->  app (FastAPI)  ->  db (Postgres)
+#
+# Start it all:   docker compose up --build
+# Stop it all:    docker compose down          (your data survives - it's in a volume)
+# Wipe data too:  docker compose down -v        (deletes the volume; fresh DB next time)
+#
+# IMPORTANT: This whole file is LOCAL ONLY. On Fly.io you do NOT use Compose,
+# Caddy, or this Postgres container - Fly runs the app from the Dockerfile,
+# Fly's own proxy handles HTTPS, and your DB is Neon (managed Postgres).
+services:
+  # ---------------------------------------------------------------
+  # Your FastAPI + LangGraph application (built from the Dockerfile)
+  # ---------------------------------------------------------------
+  app:
+    build: .
+    env_file:
+      - .env
+    environment:
+      # DATABASE_URL: postgresql://sahayak:sahayak@db:5432/sahayak
+      CHROMA_DIR: /app/chroma_db          # tells the app where to store Chroma data
+    volumes:
+      - .:/app                            # live-mount source so edits show up without a rebuild
+      - chroma_data:/app/chroma_db        # permanent storage for that folder (wins over the line above)
+    # Overrides the Dockerfile's CMD for local dev only: --reload watches the
+    # mounted source and restarts the app on save. Fly/production still use
+    # the Dockerfile's CMD as-is (no --reload there).
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # PostgreSQL database - LOCAL ONLY
+  # (In production this role is played by Neon, not this container.)
+  # ---------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"          # <-- add this: lets your PC reach the database
+    environment:
+      POSTGRES_USER: sahayak
+      POSTGRES_PASSWORD: sahayak
+      POSTGRES_DB: sahayak
+    volumes:
+      # THE KEY LINE: this volume is the database's permanent "external hard drive".
+      # The container is disposable; this volume is not. Data survives restarts.
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sahayak"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # Caddy - the reverse proxy / secure front door
+  # This is what you learn so you can speak to "reverse proxy" in the interview.
+  # ---------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+      - "8443:443"                 # https -> used when you attach a real domain
+    volumes:  
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+
+# Named volumes = persistent storage managed by Docker.
+volumes:
+  postgres_data:
+  chroma_data:
+  caddy_data:
+  caddy_config:
+
+

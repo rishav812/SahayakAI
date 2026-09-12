@@ -129,3 +129,6 @@ websockets==15.0.1
 xxhash==3.7.1
 yarl==1.24.2
 zstandard==0.25.0
+python-multipart>=0.0.9
+twilio>=9.0.0
+
