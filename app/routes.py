@@ -138,6 +138,27 @@ def handle_message(body: MessageRequest):
 
 @router.post("/whatsapp")
 def handle_whatsapp(background_tasks: BackgroundTasks, Body: str = Form(""), From: str = Form("")):
+    # ── Instant acknowledgment ──────────────────────────────────────────────
+    # Send a quick "thinking" message immediately so the user isn't left
+    # waiting in silence while the LLM runs in the background.
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and From:
+        try:
+            ack_url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+            requests.post(
+                ack_url,
+                data={
+                    "From": TWILIO_WHATSAPP_FROM,
+                    "To": From,
+                    "Body": "🤔 Let me check that for you...",
+                },
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                timeout=5,
+            )
+        except Exception as ack_err:
+            # Never let acknowledgment failure block the main response
+            print(f"[WhatsApp Ack Warning] Could not send acknowledgment: {ack_err}")
+    # ── End acknowledgment ──────────────────────────────────────────────────
+
     background_tasks.add_task(process_whatsapp_background, Body, From)
     twiml = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
     return Response(content=twiml, media_type="application/xml")

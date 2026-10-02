@@ -35,26 +35,42 @@ class Router(BaseModel):
 system_prompt = f"""
 You are a supervisor managing a conversation between these workers: {members}.
 
+Each worker is a STRICT SPECIALIST — they only handle their own domain and will
+not answer topics belonging to another worker. YOUR job is to route each topic
+to the correct worker. For multi-part questions, route to each responsible worker
+one at a time (sequentially) — never assume one worker will cover another's topic.
+
 - admission: handles ONLY fee, cost, price, charges, and batch-duration numerical lookups.
-  It looks up exact fee amounts with a tool. Route here for ANY question that asks
+  It looks up exact fee amounts with a database tool. Route here for ANY question that asks
   "how much" or "what is the fee/cost" for a specific course or batch.
+  It will NOT answer booking, FAQ, or policy questions.
 - faq: handles questions about syllabus, schedule, eligibility, exam pattern,
   documents required, refund policy, installment rules, discipline, and other
   institute policy questions, by searching institute documents. Route refund policy
   and installment rules questions here. Never route specific course fee-amount questions here.
-- scheduling: handles booking or scheduling a demo class (e.g. "book a demo",
+  It will NOT answer fee amounts or booking questions.
+- scheduling: handles ONLY booking or scheduling a demo class (e.g. "book a demo",
   "schedule a class", "demo class chahiye", or providing a time/date for a demo).
   It reserves an actual slot with a tool. Route here for ANY request to book, schedule,
   or reserve a demo class, or when the user provides a time/slot choice, date, or
   follow-up response to demo booking (e.g. "Kal subah 11 baje", "13 September", "book karni h").
+  It will NOT answer fee amounts or FAQ/policy questions.
 
-Given the user request, choose which worker should act next.
-Each worker will respond with their result.
-- ALWAYS route to scheduling if the user's latest message is a follow-up answer or slot choice (e.g. providing a time, date, or repeat booking request) to a previous scheduling prompt or alternative options offer, unless scheduling has ALREADY responded in this current user turn.
-A single worker's response may only cover PART of the user's original question.
-Compare what has been answered so far against the full ORIGINAL user question to decide what, if anything, is still missing:
-- If every distinct topic actually present in the user request has now been addressed in the current turn, respond with FINISH.
-- If admission replies with "{COVERAGE_GATE_REPLY}", treat the fee part as fully handled — do not route to faq to try to find that same fee.
+CRITICAL ROUTING RULES:
+1. For multi-part questions (e.g. "fee kitni h AUR demo book karna h"), you MUST
+   route to EACH responsible worker separately. Example: route to admission first
+   for the fee part, then come back and route to scheduling for the booking part.
+   NEVER assume scheduling or faq will also answer the fee — they won't.
+2. ALWAYS route to scheduling if the user's latest message is a follow-up answer or
+   slot choice to a previous scheduling prompt, unless scheduling has ALREADY responded
+   in this current user turn.
+3. A single worker's response covers only their own topic. After each worker responds,
+   check the FULL original question — if any other topic is still unanswered by its
+   responsible worker, route to that worker next.
+4. Respond with FINISH only when EVERY distinct topic in the user's request has been
+   answered by the correct specialist worker in this turn.
+5. If admission replies with "{COVERAGE_GATE_REPLY}", treat the fee part as fully
+   handled — do not route to faq to try to find that same fee.
 """
 
 
@@ -93,7 +109,7 @@ def supervisor_node(state: State) -> Command[Literal["admission", "faq", "schedu
                 print("[supervisor] deterministic follow-up -> scheduling")
                 return Command(goto="scheduling", update={"next": "scheduling"})
 
-    messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+    messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
     response = llm.with_structured_output(Router).invoke(messages)
 
     if isinstance(response, Router):
@@ -111,6 +127,23 @@ def supervisor_node(state: State) -> Command[Literal["admission", "faq", "schedu
 
 # --- Admission agent (fee lookups) ---
 
+# ── LANE RULE (generic boundary enforcement) ────────────────────────────────
+# Every agent gets an explicit list of domains it must NEVER touch.
+# This prevents any agent from hallucinating an answer that belongs to
+# another specialist, regardless of how the user phrases the question.
+# ────────────────────────────────────────────────────────────────────────────
+ADMISSION_LANE_RULE = (
+    "\n\nSTRICT LANE RULE — YOU ARE A FEE SPECIALIST ONLY:\n"
+    "Your ONLY job is to look up and return the exact fee/cost/batch-duration "
+    "using the get_fee tool. You must NEVER answer, guess, or comment on:\n"
+    "  • Demo class booking, scheduling, or slot availability (scheduling agent's job)\n"
+    "  • Syllabus, eligibility, exam pattern, documents, refund policy, installment "
+    "rules, or any other institute policy (faq agent's job)\n"
+    "If the user's message also contains any of those topics, act as if those parts "
+    "were never asked — answer only the fee part and nothing else. "
+    "Never apologize for not covering other topics. Just give the fee and stop."
+)
+
 admission_react_agent = create_react_agent(
     llm,
     tools=[get_fee],
@@ -126,6 +159,7 @@ admission_react_agent = create_react_agent(
         "not your job. Do not answer it, guess at it, apologize for it, or say anything "
         "about it at all — act as if that part of the question was never asked, and "
         "give a clean answer for the fee part alone."
+        + ADMISSION_LANE_RULE
     ),
 )
 
@@ -156,6 +190,18 @@ retriever_tool = create_retriever_tool(
     "Search institute documents to answer questions about syllabus, schedule, eligibility, exam pattern, refund policy, or admission policy.",
 )
 
+FAQ_LANE_RULE = (
+    "\n\nSTRICT LANE RULE — YOU ARE A POLICY/FAQ SPECIALIST ONLY:\n"
+    "Your ONLY job is to search institute documents and answer policy/FAQ questions. "
+    "You must NEVER answer, guess, or comment on:\n"
+    "  • Specific course fee amounts or batch costs (e.g. 'JEE 1 saal ki fees') "
+    "— a dedicated fee tool handles those with exact DB values; your guess will be wrong\n"
+    "  • Demo class booking, scheduling, or slot availability (scheduling agent's job)\n"
+    "If the user's message also contains fee-amount or booking questions, act as if "
+    "those parts were never asked — answer only the policy/FAQ part and nothing else. "
+    "Never state a rupee amount for a course fee from memory or assumption."
+)
+
 faq_react_agent = create_react_agent(
     llm,
     tools=[retriever_tool],
@@ -166,6 +212,7 @@ faq_react_agent = create_react_agent(
         "You do NOT handle course fee amount lookup questions (e.g. 'how much is the course fee?') — another assistant handles those. "
         "However, you DO handle policy questions including refund policy, fee installments, rules, and cancellation terms. "
         "If a user asks whether fees are refundable or what the refund policy is, search the documents for refund policy and answer clearly."
+        + FAQ_LANE_RULE
     ),
 )
 
@@ -185,6 +232,20 @@ def faq_node(state: State) -> Command[Literal["supervisor"]]:
 
 # --- Scheduling agent (demo booking) ---
 
+SCHEDULING_LANE_RULE = (
+    "\n\nSTRICT LANE RULE — YOU ARE A DEMO BOOKING SPECIALIST ONLY:\n"
+    "Your ONLY job is to book or check demo class slots using your tools. "
+    "You must NEVER answer, guess, or comment on:\n"
+    "  • Course fee amounts, costs, or prices (e.g. 'JEE 1 saal ki fees kitni h') "
+    "— a dedicated fee tool handles those with exact DB values; any amount you state "
+    "will be a hallucination and will be WRONG\n"
+    "  • Syllabus, eligibility, exam pattern, documents, refund policy, or any other "
+    "institute policy (faq agent's job)\n"
+    "If the user's message also contains fee or policy questions, act as if those "
+    "parts were never asked — handle only the booking/scheduling part and nothing else. "
+    "Never state any rupee amount or policy detail from memory."
+)
+
 def scheduling_node(state: State, config: RunnableConfig) -> Command[Literal["supervisor"]]:
     print("[scheduling] invoked")
     phone = config["configurable"]["thread_id"]
@@ -192,6 +253,7 @@ def scheduling_node(state: State, config: RunnableConfig) -> Command[Literal["su
         SystemMessage(
             f"The user's phone number is {phone}. Use this automatically for "
             "any book_demo call — never ask the user for their phone number."
+            + SCHEDULING_LANE_RULE
         )
     ] + state["messages"]
     result = scheduling_agent.invoke({"messages": messages})
