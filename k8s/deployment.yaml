@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sahayakai-deployment
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sahayakai
+  template:
+    metadata:
+      labels:
+        app: sahayakai
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: sahayakai
+        image: rishav812/sahayakai:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: DATABASE_URL
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: OPENAI_API_KEY
+        - name: TWILIO_ACCOUNT_SID
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: TWILIO_ACCOUNT_SID
+        - name: TWILIO_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: TWILIO_AUTH_TOKEN
+        - name: TWILIO_WHATSAPP_FROM
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: TWILIO_WHATSAPP_FROM
+        - name: LANGCHAIN_TRACING_V2
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: LANGCHAIN_TRACING_V2
+        - name: LANGCHAIN_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: LANGCHAIN_ENDPOINT
+        - name: LANGCHAIN_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: LANGCHAIN_API_KEY
+        - name: LANGCHAIN_PROJECT
+          valueFrom:
+            secretKeyRef:
+              name: sahayakai-secrets
+              key: LANGCHAIN_PROJECT
+        - name: GENERATE_GRAPH_PNG
+          value: "false"
+        - name: CHROMA_DIR
+          value: "/app/chroma_db"
+        volumeMounts:
+        - mountPath: /app/chroma_db
+          name: chroma-storage
+      volumes:
+      - name: chroma-storage
+        persistentVolumeClaim:
+          claimName: chroma-pvc
