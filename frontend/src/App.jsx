@@ -128,14 +128,13 @@ export default function App() {
           
           <div className="max-w-4xl mx-auto rounded-2xl overflow-hidden glass-card p-2 sm:p-3 shadow-2xl border border-slate-800/80">
             <div className="relative aspect-video rounded-xl bg-slate-900 overflow-hidden border border-slate-800/60 group">
-              <video 
-                controls 
-                className="w-full h-full object-cover rounded-lg"
-                poster="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100%' height='100%' viewBox='0 0 800 450'><rect width='100%' height='100%' fill='%230f172a'/><text x='50%' y='48%' font-family='sans-serif' font-size='24' font-weight='bold' fill='%2310b981' text-anchor='middle'>SahayakAI Live Demo</text><text x='50%' y='56%' font-family='sans-serif' font-size='14' fill='%2364748b' text-anchor='middle'>Click play to watch video (/demo.mp4)</text></svg>"
-              >
-                <source src="/demo.mp4" type="video/mp4" />
-                Your browser does not support the video tag.
-              </video>
+              <iframe
+                className="w-full h-full rounded-lg"
+                src="https://www.youtube.com/embed/L-OwwxWSKAA"
+                title="SahayakAI Live Demo"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                allowFullScreen
+              ></iframe>
             </div>
           </div>
         </section>

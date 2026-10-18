@@ -7,3 +7,4 @@ chroma_db/
 .pytest_cache/
 PRD_coaching_ops_agent.md
 kubeconfig.yaml
+*.mp4
