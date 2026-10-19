@@ -1,0 +1,100 @@
+name: CI/CD Pipeline - Test, Build & Deploy
+
+# 1. Triggers: When should this pipeline run?
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  # ========================================================
+  # JOB 1: Continuous Integration (CI Gate)
+  # Runs tests on every Push and Pull Request
+  # ========================================================
+  test:
+    name: 🧪 Run Pytest Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Tests
+        run: |
+          pytest tests/
+
+  # ========================================================
+  # JOB 2: Continuous Delivery & Deployment (CD)
+  # Only runs if 'test' passes AND on push to 'main'
+  # ========================================================
+  build-and-deploy:
+    name: 🚀 Build, Push & Deploy to Kubernetes
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx (Fast Multi-platform builder)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/sahayakai:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/sahayakai:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: Configure Kubeconfig for DigitalOcean
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_DATA }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Deploy to DigitalOcean Kubernetes
+        run: |
+          # Apply persistent volume and service manifests
+          kubectl apply -f k8s/pvc.yaml
+          kubectl apply -f k8s/service.yaml
+          
+          # Roll out the new Docker image tagged with Git commit SHA
+          kubectl set image deployment/sahayakai-deployment sahayakai=${{ secrets.DOCKERHUB_USERNAME }}/sahayakai:${{ github.sha }}
+          
+          # Wait up to 3 minutes for rollout to finish with zero downtime
+          kubectl rollout status deployment/sahayakai-deployment --timeout=180s
+
+      - name: Confirm Running Pods
+        run: |
+          kubectl get pods -l app=sahayakai
